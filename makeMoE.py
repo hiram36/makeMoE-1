@@ -3,13 +3,16 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.nn import init
 
+from get_device_info import get_device
+
 # hyperparameters
 batch_size = 16 # how many independent sequences will we process in parallel?
 block_size = 32 # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 100
 learning_rate = 1e-3
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+#device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device=get_device()
 eval_iters = 400
 head_size = 16
 n_embed = 128
@@ -18,6 +21,8 @@ n_layer = 8
 dropout = 0.1
 num_experts = 8 # This can be adjusted depending on the overall number of parameters
 top_k = 2 # This controls the number of active parameters
+
+model_file_path = 'model/makemoe_9M.pth'
 
 torch.manual_seed(1337)
 
@@ -63,6 +68,10 @@ def estimate_loss(model):
     model.train()
     return out
 
+
+def save_model(model, model_file_path):
+    torch.save(model, model_file_path)
+
 class Head(nn.Module):
     """ one head of self-attention """
 
@@ -102,6 +111,7 @@ class MultiHeadAttention(nn.Module):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
+    
 #Expert module
 class Expert(nn.Module):
     """ An MLP is a simple linear layer followed by a non-linearity i.e. each Expert """
@@ -145,8 +155,6 @@ class NoisyTopkRouter(nn.Module):
         return router_output, indices
 
 #Now create the sparse mixture of experts module
-
-
 class SparseMoE(nn.Module):
     def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
         super(SparseMoE, self).__init__()
@@ -187,10 +195,53 @@ class SparseMoE(nn.Module):
         final_output += updates.view(batch_size, seq_len, -1)
 
         return final_output
-      
+
+class SparseMoE_V2(nn.Module):
+    def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
+        super(SparseMoE, self).__init__()
+        self.router = NoisyTopkRouter(n_embed, num_experts, top_k)
+        self.experts = nn.ModuleList([Expert(n_embed) for _ in range(num_experts)])
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.num_experts = num_experts
+    
+    def forward(self, x):
+    # Assuming x has shape [batch_size, seq_len, n_embd]
+        batch_size, seq_len, _ = x.shape
+        gating_output, indices = self.router(x)
+        final_output = torch.zeros_like(x)
+
+        # Flatten the batch and sequence dimensions to treat each token independently
+        flat_x = x.view(-1, x.size(-1))  
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
+
+        tokens_per_batch = batch_size * seq_len * self.top_k
+        expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
+
+        updates = torch.zeros_like(flat_x)
+
+        for i, expert in enumerate(self.experts):
+            expert_mask = (indices == i).any(dim=-1)
+            flat_mask = expert_mask.view(-1)
+            selected_indices = torch.nonzero(flat_mask).squeeze(-1)
+
+            limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
+            if limited_indices.numel() > 0:
+                expert_input = flat_x[limited_indices]
+                expert_output = expert(expert_input)
+
+                gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
+                weighted_output = expert_output * gating_scores
+
+                updates.index_add_(0, limited_indices, weighted_output)
+
+        # Reshape updates to match the original dimensions of x
+        final_output += updates.view(batch_size, seq_len, -1)
+
+        return final_output
+
 #First create a self attention + mixture of experts block, that may be repeated several number of times
 #Copy pasting key architecture variables for clarity
-
 class Block(nn.Module):
     """ Mixture of Experts Transformer block: communication followed by computation (multi-head self attention + SparseMoE) """
 
@@ -258,14 +309,24 @@ class SparseMoELanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
       
-
+'''
+kaiming 和 relu 适配 
+'''
 def kaiming_init_weights(m):
     if isinstance (m, (nn.Linear)):
         init.kaiming_normal_(m.weight)
 
+'''
+xavier glorot 和 tanh 适配 
+'''
+def glorot_init_weights(m):
+    if isinstance (m, (nn.Linear)):
+        init.xavier_normal_(m.weight)
+
 def main():
     model = SparseMoELanguageModel()
     model.apply(kaiming_init_weights)
+    #model.apply(glorot_init_weights)
     model = model.to(device)
 
     print(sum(p.numel() for p in model.parameters()) / 1e6, 'M parameters')
@@ -293,6 +354,8 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+
+    save_model(model=model, model_file_path=model_file_path)
 
 if __name__ == "__main__":
     main()
