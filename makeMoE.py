@@ -8,7 +8,7 @@ from get_device_info import get_device
 # hyperparameters
 batch_size = 16 # how many independent sequences will we process in parallel?
 block_size = 32 # what is the maximum context length for predictions?
-max_iters = 5000
+max_iters = 450
 eval_interval = 100
 learning_rate = 1e-3
 #device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -21,13 +21,18 @@ n_layer = 8
 dropout = 0.1
 num_experts = 8 # This can be adjusted depending on the overall number of parameters
 top_k = 2 # This controls the number of active parameters
+train_ratio = 0.9
 
-model_file_path = 'model/makemoe_9M.pth'
-
+model_file_path = 'model/makemoe_9M_v1.pth'
+train_file_path = 'input.txt'
 torch.manual_seed(1337)
 
-with open('input.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
+def get_train_data(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = f.read()
+    return data
+
+text = get_train_data(train_file_path)
 
 # here are all the unique characters that occur in this text
 chars = sorted(list(set(text)))
@@ -40,7 +45,7 @@ decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integ
 
 # Train and test splits
 data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data)) # first 90% will be train, rest val
+n = int(train_ratio * len(data)) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
 
@@ -68,7 +73,6 @@ def estimate_loss(model):
     model.train()
     return out
 
-
 def save_model(model, model_file_path):
     torch.save(model, model_file_path)
 
@@ -90,10 +94,11 @@ class Head(nn.Module):
         # compute attention scores ("affinities")
         wei = q @ k.transpose(-2,-1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = F.softmax(wei, dim=-1).cpu().clone()   # (B, T, T)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
-        v = self.value(x) # (B,T,C)
+        v = self.value(x).to(device) # (B,T,C)
+        wei = wei.to(device)
         out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
         return out
 
@@ -120,7 +125,7 @@ class Expert(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embed, 4 * n_embed),
-            nn.ReLU(),
+            nn.ReLU(inplace=False),
             nn.Linear(4 * n_embed, n_embed),
             nn.Dropout(dropout),
         )
@@ -151,7 +156,7 @@ class NoisyTopkRouter(nn.Module):
         top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
         zeros = torch.full_like(noisy_logits, float('-inf'))
         sparse_logits = zeros.scatter(-1, indices, top_k_logits)
-        router_output = F.softmax(sparse_logits, dim=-1)
+        router_output = F.softmax(sparse_logits, dim=-1).cpu().clone()
         return router_output, indices
 
 #Now create the sparse mixture of experts module
@@ -172,7 +177,7 @@ class SparseMoE(nn.Module):
 
         # Flatten the batch and sequence dimensions to treat each token independently
         flat_x = x.view(-1, x.size(-1))  
-        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1)).to(device)
 
         tokens_per_batch = batch_size * seq_len * self.top_k
         expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
@@ -183,7 +188,15 @@ class SparseMoE(nn.Module):
             expert_mask = (indices == i).any(dim=-1)
             flat_mask = expert_mask.view(-1)
             selected_indices = torch.nonzero(flat_mask).squeeze(-1)
+            '''
+            张量标识了专家处理的第i个标记。
+            如果分配给该专家的总标记数超过其容量，那么张量将被截断以匹配专家的最大处理能力。
+            否则，它将被直接用于该专家下的计算。
+            这些计算涉及通过专家确定每个标记的输出，然后应用相应的门控值来得出加权输出。
+            这个加权输出被逐步地与最终输出张量结合。
+            '''
             limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
+            limited_indices = limited_indices.to(device=device)
             if limited_indices.numel() > 0:
                 expert_input = flat_x[limited_indices]
                 expert_output = expert(expert_input)
@@ -192,51 +205,7 @@ class SparseMoE(nn.Module):
                 updates.index_add_(0, limited_indices, weighted_output)
 
         # Reshape updates to match the original dimensions of x
-        final_output += updates.view(batch_size, seq_len, -1)
-
-        return final_output
-
-class SparseMoE_V2(nn.Module):
-    def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
-        super(SparseMoE, self).__init__()
-        self.router = NoisyTopkRouter(n_embed, num_experts, top_k)
-        self.experts = nn.ModuleList([Expert(n_embed) for _ in range(num_experts)])
-        self.top_k = top_k
-        self.capacity_factor = capacity_factor
-        self.num_experts = num_experts
-    
-    def forward(self, x):
-    # Assuming x has shape [batch_size, seq_len, n_embd]
-        batch_size, seq_len, _ = x.shape
-        gating_output, indices = self.router(x)
-        final_output = torch.zeros_like(x)
-
-        # Flatten the batch and sequence dimensions to treat each token independently
-        flat_x = x.view(-1, x.size(-1))  
-        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
-
-        tokens_per_batch = batch_size * seq_len * self.top_k
-        expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
-
-        updates = torch.zeros_like(flat_x)
-
-        for i, expert in enumerate(self.experts):
-            expert_mask = (indices == i).any(dim=-1)
-            flat_mask = expert_mask.view(-1)
-            selected_indices = torch.nonzero(flat_mask).squeeze(-1)
-
-            limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
-            if limited_indices.numel() > 0:
-                expert_input = flat_x[limited_indices]
-                expert_output = expert(expert_input)
-
-                gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
-                weighted_output = expert_output * gating_scores
-
-                updates.index_add_(0, limited_indices, weighted_output)
-
-        # Reshape updates to match the original dimensions of x
-        final_output += updates.view(batch_size, seq_len, -1)
+        final_output = final_output + updates.view(batch_size, seq_len, -1)
 
         return final_output
 
@@ -275,8 +244,10 @@ class SparseMoELanguageModel(nn.Module):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B,T,C)
+        tok_emb = self.token_embedding_table(idx).to(device) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        #pos_emb = self.position_embedding_table(torch.arange(T)) # (T,C)
+
         x = tok_emb + pos_emb # (B,T,C)
         x = self.blocks(x) # (B,T,C)
         x = self.ln_f(x) # (B,T,C)
@@ -302,7 +273,7 @@ class SparseMoELanguageModel(nn.Module):
             # focus only on the last time step
             logits = logits[:, -1, :] # becomes (B, C)
             # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
+            probs = F.softmax(logits, dim=-1).cpu().clone() # (B, C)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
             # append sampled index to the running sequence
@@ -323,11 +294,21 @@ def glorot_init_weights(m):
     if isinstance (m, (nn.Linear)):
         init.xavier_normal_(m.weight)
 
+def get_model_parameters_numel(model):
+    total_params = 0
+    for name, param in model.named_parameters():
+        each_param_numel = param.numel()
+        total_params = total_params + each_param_numel
+        print(f'{name} {each_param_numel}')
+    return total_params
+
 def main():
     model = SparseMoELanguageModel()
     model.apply(kaiming_init_weights)
     #model.apply(glorot_init_weights)
     model = model.to(device)
+    total_params = get_model_parameters_numel(model=model)
+    print(f'model parameters: {total_params}')
 
     print(sum(p.numel() for p in model.parameters()) / 1e6, 'M parameters')
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -340,7 +321,6 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
     for iter in range(max_iters):
-
         # every once in a while evaluate the loss on train and val sets
         if iter % eval_interval == 0 or iter == max_iters - 1:
             losses = estimate_loss(model)
@@ -348,14 +328,40 @@ def main():
 
         # sample a batch of data
         xb, yb = get_batch('train')
-
+        xb = xb.to(device=device)
+        yb = yb.to(device=device)
         # evaluate the loss
         logits, loss = model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        with torch.autograd.set_detect_anomaly(True):
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
     save_model(model=model, model_file_path=model_file_path)
 
+
+def demo():
+    model = SparseMoELanguageModel()
+    model.apply(kaiming_init_weights)
+    model = model.to(device)
+    # sample a batch of data
+    xb, yb = get_batch('train')
+    x = xb[:3, :]
+    y = yb[:3, :]
+    print(x.shape)
+    print(y.shape)
+    x.to(device)
+    y.to(device)
+
+    logits, loss = model(x, y)
+    
+    print(f'logits.shape===> {logits.shape}')
+    print(f'logits===> {logits}')
+    print(f'loss.shape===> {loss.shape}')
+    print(f'loss===> {loss}')
+
+
+
 if __name__ == "__main__":
-    main()
+    #main()
+    demo()

@@ -61,7 +61,7 @@ class SparseDispatcher(object):
         self._part_sizes = (gates > 0).sum(0).tolist()
         # expand gates to match with self._batch_index
         gates_exp = gates[self._batch_index.flatten()]
-        self._nonzero_gates = torch.gather(gates_exp, 1, self._expert_index)
+        self._nonzero_gates = torch.gather(input=gates_exp, dim=1, index=self._expert_index) # 沿着由dim指定的轴收集数值
 
     def dispatch(self, inp):
         """Create one input Tensor for each expert.
@@ -172,6 +172,14 @@ class sMoE(nn.Module):
         Returns:
         a `Scalar`.
         """
+        """
+        input为一个expert nums长的向量，这个向量中的每一个element代表了某个expert处理的样本数量
+        用这个向量的方差除以其均值，可以看到:
+        均值越小，方差越大则loss 越大，此时意味着experts之间的不均衡，
+        均值越大，方差越小则loss 越小，此时意味着experts之间相对比较均衡
+        因此这一额外的loss鼓励每个expert较为均匀的瓜分batch中不同的samples。
+        """
+        print(f'input===> {x}')
         eps = 1e-10
         # if only num_experts = 1
 
@@ -214,7 +222,9 @@ class sMoE(nn.Module):
         top_values_flat = noisy_top_values.flatten()
         # top-k时会把无关的expert的gating置为0， 这时要填补一些随机值，使得参数是可导的
         threshold_positions_if_in = torch.arange(batch, device=clean_values.device) * m + self.topk
+        print(f'threshold_positions_if_in===> {threshold_positions_if_in}')
         threshold_if_in = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_in), 1)
+        # Xi noisy gating > Kth excluding 说明Noisy 无用???
         is_in = torch.gt(noisy_values, threshold_if_in)
         threshold_positions_if_out = threshold_positions_if_in - 1
         threshold_if_out = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_out), 1)
@@ -237,9 +247,15 @@ class sMoE(nn.Module):
             gates: a Tensor with shape [batch_size, num_experts]
             load: a Tensor with shape [num_experts]
         """
-        clean_logits = x @ self.w_gate
+        clean_logits = x @ self.w_gate #w noise 是一个可训练的linear层？？？
+        '''
+        加入噪声主要是为了缓解出现部分experts被频繁选择，从而导致少量experts dominate 大量下游任务的情况.
+        也可以用dropout来替代，不过这里的噪声是通过一个可学习的linear matrix来实现的，这个倒是有意思，产生噪声的过程也和model的target 强耦合了，interesting。
+        '''
         if self.noisy_gating and train:
             raw_noise_stddev = x @ self.w_noise
+            # 保证stddev 大于等于0
+            # softplus是relu的平滑近似
             noise_stddev = ((self.softplus(raw_noise_stddev) + noise_epsilon))
             noisy_logits = clean_logits + (torch.randn_like(clean_logits) * noise_stddev)
             logits = noisy_logits
@@ -248,8 +264,19 @@ class sMoE(nn.Module):
         # 选出top-k gating值和序号
         # calculate topk + 1 that will be needed for the noisy gates
         top_logits, top_indices = logits.topk(min(self.topk + 1, self.num_experts), dim=1)
+        print(f'top_logits===> {top_logits}')
+        print(f'top_indices===> {top_indices}')
+        # 直接赋值？
         top_k_logits = top_logits[:, :self.topk]
         top_k_indices = top_indices[:, :self.topk]
+        print(f'top_k_logits===> {top_k_logits}')
+        print(f'top_k_indices===> {top_k_indices}')
+
+        #top_k_logits, top_k_indices = logits.topk(self.topk, dim=1)
+        #top_logits = top_k_logits
+        #print(f'top_k_logits===> {top_k_logits}')
+        #print(f'top_k_indices===> {top_k_indices}')
+
         top_k_gates = self.softmax(top_k_logits)
 
         zeros = torch.zeros_like(logits, requires_grad=True)
@@ -273,15 +300,20 @@ class sMoE(nn.Module):
         training loss of the model.  The backpropagation of this loss
         encourages all experts to be approximately equally used across a batch.
         """
-        # 1. 计算noisy top k gating决定哪几个expert会进行计算
+        # 1. 计算noisy top k gating决定将🈶️哪几个expert来处理，并确定每个专家模型需要对生成的输出内容所做的贡献（权重）。
         gates, load = self.noisy_top_k_gating(x, self.training)
         # calculate importance loss
+        # 计算每个被topk选择出来的 experts分配的样本的数量???
+        # 根据样本的sample weights 的 sum来计算
+        # expert importance是为了使得不同experts都受到相对公平的训练，缓解gate的坍缩问题，即少量experts dominate 所有gate 的 score
         importance = gates.sum(0)
-        # 负载均衡loss
+        # 鼓励不同的专家能够负载均衡 load loss
+        # 加入关于importance的loss作为额外的loss项
         loss = self.cv_squared(importance) + self.cv_squared(load)
+        # loss_coef是一个放缩系数，用于对额外的loss进行放缩从而避免其太大影响到主的多任务的loss
         loss *= loss_coef
 
-        # 2. batch dispatcher 分配不同的数据给不同的专家，提高训练并行性
+        # 2. batch dispatcher 分配不同的token给不同的专家，提高训练并行性
         dispatcher = SparseDispatcher(self.num_experts, gates)
         expert_inputs = dispatcher.dispatch(x)
         gates = dispatcher.expert_to_gates()

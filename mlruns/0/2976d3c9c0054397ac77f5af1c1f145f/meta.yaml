@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/kenshin/workspace/makeMoE/mlruns/0/2976d3c9c0054397ac77f5af1c1f145f/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 2976d3c9c0054397ac77f5af1c1f145f
+run_name: whimsical-steed-237
+run_uuid: 2976d3c9c0054397ac77f5af1c1f145f
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1716037370381
+status: 1
+tags: []
+user_id: kenshin
